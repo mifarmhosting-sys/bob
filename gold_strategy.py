@@ -52,26 +52,35 @@ class GoldStrategyEngine:
     def update_15m_boundaries(self, candles_15m: List[Candle]):
         """
         Updates the Asian Session boundaries (High/Low) based on 15m candles
-        from market open until 9:30 AM IST.
+        from market open until 9:30 AM IST of the current day.
         """
         high = -1.0
         low = float('inf')
         
         cutoff_time = time(9, 30)
+        today = datetime.now(IST_TZ).date()
+        valid_candles = 0
         
         for candle in candles_15m:
-            c_time = candle.timestamp.astimezone(IST_TZ).time()
-            if c_time <= cutoff_time:
+            dt_ist = candle.timestamp.astimezone(IST_TZ)
+            c_date = dt_ist.date()
+            c_time = dt_ist.time()
+            
+            if c_date == today and c_time <= cutoff_time:
+                valid_candles += 1
                 if candle.high > high:
                     high = candle.high
                 if candle.low < low:
                     low = candle.low
         
-        if high != -1.0 and low != float('inf'):
-            self.asian_boundaries = SessionBoundaries(high=high, low=low, is_set=True)
-            logger.info(f"Asian Boundaries Set: High={high}, Low={low}")
+        if high != -1.0 and low != float('inf') and valid_candles > 0:
+            if not self.asian_boundaries.is_set or self.asian_boundaries.high != high or self.asian_boundaries.low != low:
+                self.asian_boundaries = SessionBoundaries(high=high, low=low, is_set=True)
+                logger.info(f"Asian Boundaries Set/Updated: High={high}, Low={low}")
         else:
-            logger.warning("Not enough 15m data to set Asian boundaries.")
+            if self.asian_boundaries.is_set:
+                logger.warning("Asian boundaries invalidated (no valid candles).")
+            self.asian_boundaries.is_set = False
 
     def is_valid_trading_window(self, dt: datetime) -> bool:
         """

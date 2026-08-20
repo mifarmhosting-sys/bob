@@ -16,7 +16,20 @@ class MT5GoldBot:
     def __init__(self, risk_per_trade: float = 100.0, entry_style: str = "aggressive"):
         self.engine = GoldStrategyEngine(risk_per_trade=risk_per_trade, entry_style=entry_style)
         self.last_processed_time = None
+        self.broker_offset = 0
+
         
+    def _get_broker_utc_offset(self) -> int:
+        """Returns the broker's timezone offset from UTC in seconds."""
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if not tick:
+            return 0
+        server_time = tick.time
+        utc_now = datetime.now(pytz.UTC).timestamp()
+        # Round to nearest 30 mins (1800s) to handle offsets cleanly
+        offset = round((server_time - utc_now) / 1800) * 1800
+        return int(offset)
+
     def initialize_mt5(self) -> bool:
         """Initialize the connection to the MT5 terminal"""
         if not mt5.initialize():
@@ -29,14 +42,16 @@ class MT5GoldBot:
             mt5.shutdown()
             return False
             
-        logger.info(f"Successfully connected to MT5. Trading {SYMBOL}")
+        self.broker_offset = self._get_broker_utc_offset()
+        logger.info(f"Successfully connected to MT5. Trading {SYMBOL}. Broker UTC offset: {self.broker_offset/3600}h")
         return True
 
     def _convert_mt5_rates_to_candles(self, rates) -> list[Candle]:
         candles = []
         for r in rates:
-            # MT5 timestamps are in UTC. We need to parse them as UTC.
-            dt_utc = datetime.fromtimestamp(r['time'], tz=pytz.UTC)
+            # MT5 timestamps are broker server time. Convert to true UTC.
+            actual_utc = r['time'] - self.broker_offset
+            dt_utc = datetime.fromtimestamp(actual_utc, tz=pytz.UTC)
             candles.append(Candle(
                 timestamp=dt_utc,
                 open=r['open'],
@@ -49,8 +64,8 @@ class MT5GoldBot:
     def fetch_data(self):
         """Fetches 15m and 5m candles and feeds them to the strategy engine"""
         # 1. Fetch today's 15m candles to establish Asian boundaries
-        # Fetching 50 bars should be enough to cover the Asian session for the current day
-        rates_15m = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M15, 0, 50)
+        # Fetching 100 bars (25 hours) to guarantee we cover the entire current day's Asian session
+        rates_15m = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M15, 0, 100)
         if rates_15m is not None and len(rates_15m) > 0:
             candles_15m = self._convert_mt5_rates_to_candles(rates_15m)
             self.engine.update_15m_boundaries(candles_15m)
@@ -108,6 +123,10 @@ class MT5GoldBot:
         # Dynamically determine the supported filling mode for this broker
         symbol_info = mt5.symbol_info(SYMBOL)
         filling_type = mt5.ORDER_FILLING_FOK # Default to FOK
+        
+        sl = float(signal["sl"])
+        tp = float(signal["tp1"])
+        
         if symbol_info is not None:
             if symbol_info.filling_mode & mt5.SYMBOL_FILLING_IOC:
                 filling_type = mt5.ORDER_FILLING_IOC
@@ -115,6 +134,11 @@ class MT5GoldBot:
                 filling_type = mt5.ORDER_FILLING_FOK
             else:
                 filling_type = mt5.ORDER_FILLING_RETURN
+                
+            # Use broker digits to prevent Invalid Stops errors
+            price = round(price, symbol_info.digits)
+            sl = round(sl, symbol_info.digits)
+            tp = round(tp, symbol_info.digits)
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -122,8 +146,8 @@ class MT5GoldBot:
             "volume": lot,
             "type": order_type,
             "price": price,
-            "sl": float(signal["sl"]),
-            "tp": float(signal["tp1"]),
+            "sl": sl,
+            "tp": tp,
             "deviation": 20,
             "magic": 123456, # Unique ID for our bot's trades
             "comment": "Gold Strategy",
@@ -133,7 +157,9 @@ class MT5GoldBot:
         
         # Send order
         result = mt5.order_send(request)
-        if result.retcode != mt5.TRADE_RETCODE_DONE:
+        if result is None:
+            logger.error(f"Order failed, mt5.order_send returned None. Error code: {mt5.last_error()}")
+        elif result.retcode != mt5.TRADE_RETCODE_DONE:
             logger.error(f"Order failed, retcode={result.retcode}")
             # print error details
             logger.error(result._asdict())
